@@ -1,0 +1,14 @@
+package com.example.agenticurl.agent.enums;
+
+public enum StepType {
+    IMPACT_ANALYSIS,
+    API_DESIGN,
+    DATA_DESIGN,
+    IMPLEMENTATION,
+    POLICY_VALIDATION,
+    TEST_DESIGN,
+    BUILD_VERIFICATION,
+    SECURITY_VALIDATION,
+    DOCUMENTATION,
+    DELIVERY_DECISION
+}
