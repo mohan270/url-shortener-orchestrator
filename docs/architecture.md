@@ -1,61 +1,176 @@
 # Architecture Overview
 
-## Components
+> **Scope:** Current implementation of the URL Shortener Orchestrator prototype. This document describes what the code does today, not a future production deployment. See [risks and limitations](risks-and-limitations.md).
 
-The prototype is a modular monolith with two top-level domains:
+## 1. System context and boundaries
 
-- `url`: URL creation, redirect resolution, expiration, custom aliases, analytics, persistence, and API documentation.
-- `agent`: requirement understanding, planning, orchestration, governance, execution evidence, human review, recovery, replanning, and reliability metrics.
+The application is a **Java 17 / Spring Boot modular monolith** with two application domains:
 
-## Orchestration model
+- **`url`** handles short-link creation, optional expiration/custom aliases, HTTP redirects, and click-count analytics.
+- **`agent`** handles deterministic engineering-workflow planning, execution, approval, state persistence, and audit evidence.
 
-`WorkflowEngine` owns workflow lifecycle state. `IntentAnalyzer` normalizes requirements and identifies ambiguity. `PlanBuilder` converts the normalized requirement into an explicit versioned dependency graph. `GraphScheduler` loads persisted nodes and runs only nodes whose dependencies and governance gates are satisfied.
+The domains share a single Spring Boot process and **Spring Data JPA / file-backed H2** persistence. Neither domain is independently deployed. No message broker, cloud worker, LLM, or real CI/security-scanner integration is used by the current workflow implementation.
 
-The graph covers impact analysis, API/data design, implementation proposal, test design, build verification, security validation, policy validation, documentation, and delivery readiness. Data design is added when the requirement implies persistence or expiration changes.
+```mermaid
+flowchart LR
+    Client["API client / reviewer"]
+    subgraph App["Spring Boot application (single process)"]
+        URL["URL REST controller"]
+        Workflow["Workflow REST controller"]
+        URLServices["URL services"]
+        Engine["WorkflowEngine"]
+        Analysis["IntentAnalyzer + PlanBuilder"]
+        Scheduler["GraphScheduler"]
+        Executors["Deterministic ExecutionStep implementations"]
+        URL --> URLServices
+        Workflow --> Engine
+        Engine --> Analysis
+        Engine --> Scheduler
+        Scheduler --> Executors
+    end
+    Database[("File-backed H2 database")]
+    Client --> URL
+    Client --> Workflow
+    URLServices --> Database
+    Engine --> Database
+    Scheduler --> Database
+```
 
-Independent runnable nodes execute concurrently with `CompletableFuture`. Downstream nodes wait until every declared dependency is `SUCCEEDED`, providing explicit synchronization rather than linear task chaining.
+The orchestration module **models** engineering work; it does not autonomously implement a source-code change or deploy a release.
 
-## Entry and exit gates
+## 2. Component responsibilities
 
-The entry gate is requirement clarity. Ambiguous requirements transition to `NEEDS_CLARIFICATION`, and no execution graph is created until a human supplies clarification.
+| Component | Current responsibility | Key source |
+| --- | --- | --- |
+| `UrlController` / URL services | Create/resolve links and retrieve analytics | `url/controller`, `url/service` |
+| `WorkflowController` | Start, clarify, review, replan, and inspect a workflow | `agent/controller/WorkflowController.java` |
+| `WorkflowEngine` | Manage workflow lifecycle and plan versions; persist events; dispatch scheduler | `agent/execution/WorkflowEngine.java` |
+| `IntentAnalyzer` | Keyword-based risk and ambiguity classification | `agent/execution/IntentAnalyzer.java` |
+| `PlanBuilder` | Build a risk-aware dependency graph and step policies | `agent/execution/PlanBuilder.java` |
+| `GovernancePolicy` | Choose approval mode for API/data design and delivery | `agent/governance/GovernancePolicy.java` |
+| `GraphScheduler` | Select ready nodes, run independent nodes locally, persist results, pause for review | `agent/execution/GraphScheduler.java` |
+| `ExecutionStep` implementations | Return **deterministic, simulated** engineering evidence | `agent/execution/*Step.java` |
+| JPA repositories | Store workflow, step, approval, event, and shortened URL records | `agent/repository`, `url/repository` |
 
-The exit gate is delivery readiness. A delivery decision cannot run until build, security, policy, and documentation dependencies are satisfied. High-risk delivery uses review-after-execution so a human owns the final release decision.
+**Execution model:** The HTTP request enters `WorkflowEngine`; it synchronously calls `GraphScheduler`. Within each ready wave, steps run concurrently using `CompletableFuture.supplyAsync` and the default executor. This is **local concurrency**, not durable or distributed task execution.
 
-## Stateful execution and decision lineage
+## 3. Versioned execution graph
 
-Four persisted records preserve workflow state:
+`PlanBuilder` creates the following graph for a request that implies expiration or schema work. The `data-design` node is omitted for other requests.
 
-- `WorkflowEntity`: requirement, normalized requirement, risk, workflow status, current plan version, and automatic-replan count.
-- `ExecutionStepEntity`: graph node, dependencies, execution policy, status, attempts, result data, timestamps, fallback flag, and superseded flag.
-- `ApprovalEntity`: human decision scoped by workflow, plan version, step, and review phase.
-- `ExecutionEventEntity`: audit events for requirement intake, planning, execution, reviews, replanning, compensation, safe-stop, and completion.
+```mermaid
+flowchart TD
+    Impact["impact"]
+    API["api-design"]
+    Data["data-design (conditional)"]
+    Impl["implementation proposal"]
+    Test["test-design"]
+    Build["build verification"]
+    Security["security validation"]
+    Policy["policy validation"]
+    Docs["documentation"]
+    Delivery["delivery decision"]
 
-Successful node outputs are serialized and rehydrated into `ExecutionContext.sharedState` when execution resumes, preserving cross-stage context without rerunning completed nodes.
+    Impact --> API
+    Impact -.->|when required| Data
+    API --> Impl
+    Data -.->|when present| Impl
+    Impl --> Test
+    Impl --> Build
+    Test --> Build
+    Impl --> Security
+    Impl --> Policy
+    Build --> Docs
+    Security --> Docs
+    Policy --> Docs
+    Docs --> Delivery
+```
 
-## Governance and controlled autonomy
+Each persisted node has `ExecutionMode`, `FailureStrategy`, and `maxRetries`. A node is eligible to execute only when its declared dependencies have `SUCCEEDED`. Nodes that become eligible in the same wave may run concurrently; the scheduler waits for that wave before proceeding.
 
-Each node carries an `ExecutionPolicy` with an execution mode, failure strategy, and bounded retry count. `GovernancePolicy` determines human-review requirements from risk. `PolicyValidationStep` makes security, compliance, and change-control guardrails explicit in the execution graph and blocks requirements that attempt to bypass mandatory controls. `SecurityValidationStep` performs independent security validation.
+For a complete, annotated request/approval flow, see [workflow diagrams](diagrams/workflow-execution.md).
 
-Review decisions are persisted rather than stored in memory. Rejections stop the workflow. High-risk delivery executes once, persists its result, and then waits for final human approval.
+## 4. Workflow lifecycle and governance
 
-## Recovery and replanning
+`IntentAnalyzer` checks the request for predefined keywords to determine risk or require clarification. This is a deterministic heuristic, **not** an LLM inference step.
 
-Build verification has a bounded retry budget. If retries are exhausted and the node policy is `REPLAN`, the current plan is marked superseded, the plan version increments, and a new graph is generated. Automatic replanning is bounded to prevent loops; exhausting that budget produces `SAFE_STOP`.
+- Ambiguity produces `NEEDS_CLARIFICATION` before plan creation.
+- `GovernancePolicy` requires review **before** API design for medium/high risk and **before** data design when present.
+- High-risk delivery requires review **after** the delivery step; approval resumes without rerunning that completed step.
+- Approval records are scoped to workflow ID, plan version, step ID, and phase; a unique database constraint guards that tuple.
 
-Compensation is logical in this prototype: the proposed engineering change is discarded and not released. It is not a Git or infrastructure rollback.
+```mermaid
+stateDiagram-v2
+    [*] --> RECEIVED
+    RECEIVED --> NEEDS_CLARIFICATION: ambiguous request
+    NEEDS_CLARIFICATION --> PLANNED: clarification accepted
+    RECEIVED --> PLANNED: requirement understood
+    PLANNED --> RUNNING: dispatch graph
+    RUNNING --> WAITING_REVIEW: governance gate
+    WAITING_REVIEW --> RUNNING: approved
+    WAITING_REVIEW --> REJECTED: rejected
+    RUNNING --> REPLANNING: replan policy or new requirement
+    WAITING_REVIEW --> REPLANNING: new requirement
+    REPLANNING --> PLANNED: rebuild plan
+    RUNNING --> COMPLETED: all nodes complete
+    RUNNING --> COMPENSATED: logical compensation
+    RUNNING --> SAFE_STOP: no safe continuation
+```
 
-## Observability and reliability metrics
+*The diagram shows representative transitions; transitions are performed by synchronous engine methods, not by a standalone state-machine framework.*
 
-`/events`, `/steps`, and `/approvals` expose execution lineage. `/metrics` reports success rate, retry count, compensation/rollback count, MTTR, and end-to-end latency from persisted workflow state.
+## 5. Persistence and auditability
 
-## API/schema definition
+| Entity | Persisted data |
+| --- | --- |
+| `WorkflowEntity` | Requested/normalized requirement, clarification, risk, status, current plan version, automatic replan count |
+| `ExecutionStepEntity` | Node type/dependencies/policy, plan version, attempts, status, output JSON, timestamps, superseded flag |
+| `ApprovalEntity` | Step review decision and phase scoped to a specific plan version |
+| `ExecutionEventEntity` | Audit events emitted during intake, planning, execution, review, replanning, and termination |
+| `ShortUrlEntity` | Short code, target URL, creation/expiration timestamps, click count |
 
-Springdoc generates OpenAPI from the running application. Swagger UI is available at `/swagger-ui/index.html`, and the machine-readable specification is available at `/v3/api-docs`. The demo fault-injection endpoint is excluded from the production API documentation.
+Before resuming an approved workflow, the engine reads successful step JSON and **rehydrates** the in-memory execution context. Replanning marks prior steps `superseded`, increments the plan version, and retains earlier audit data.
 
-## Key decisions
+**Important distinction:** Persistence of *records* is implemented; automatic crash recovery for `RUNNING` operations is **not**. A database row alone cannot prove whether an in-flight external side effect completed.
 
-- Persist execution nodes and approvals so review pauses and application restarts do not reset workflow state.
-- Preserve earlier plan outcomes and mark them `superseded` rather than deleting or overwriting history.
-- Put autonomy and failure behavior on each graph node rather than hard-coding one workflow-wide policy.
-- Use bounded execution capabilities rather than fixed persona-style agents; the dependency graph determines which capabilities run and when.
-- Keep fault injection behind a `demo` profile so failure testing does not leak into the production API contract.
+## 6. Recovery model
+
+| Mechanism | Implemented behavior | Deliberate limitation |
+| --- | --- | --- |
+| Retry | `maxRetries` bounds repeated execution of a failing step | Local, synchronous retry; no durable backoff/retry queue |
+| Fallback | Some simulated validation failures return a `fallbackUsed` result | Not an external security-scanner failover |
+| Replan | Supersede prior plan, increment version, generate new graph | Automatic replans are limited to one |
+| Logical compensation | Discard the proposed engineering change and mark workflow `COMPENSATED` | Not an infrastructure rollback or Git revert |
+| Safe stop | Persist `SAFE_STOP` when the policy cannot continue | No automatic operator remediation |
+| Human review | Persist decisions and resume from waiting state | Concurrent review requests need stronger transaction/locking behavior |
+
+See [ADR-0004](adr/0004-governed-step-execution.md) for the scheduling trade-offs.
+
+## 7. APIs, observability, and tests
+
+- **Short links:** `POST /api/urls`, `GET /{code}`, `GET /api/urls/{code}/analytics`.
+- **Workflows:** `POST /api/workflows`, `POST /api/workflows/{id}/clarification`, `POST /api/workflows/{id}/steps/{stepId}/review`, `POST /api/workflows/{id}/replan`.
+- **Inspection:** `GET /api/workflows/{id}`, `/steps`, `/events`, `/approvals`, and `/metrics`.
+- **Contracts:** `/v3/api-docs`; Swagger UI at `/swagger-ui/index.html`.
+- **Runtime:** Spring Boot Actuator health, info, and metrics.
+- **Fault injection:** `POST /api/demo/workflows` only with Spring profile `demo`.
+
+The test suite covers URL APIs, graph planning, workflow approvals, scenario execution, OpenAPI, and architecture conventions. It does **not** yet validate production-scale concurrency, multi-process recovery, or deployed security controls. See [testing approach](testing.md).
+
+## 8. Architecture decision records
+
+- [ADR-0001: Modular monolith with domain boundaries](adr/0001-modular-monolith.md)
+- [ADR-0002: Persist versioned workflow state and evidence](adr/0002-persist-versioned-workflow-state.md)
+- [ADR-0003: Deterministic planning with risk-based human review](adr/0003-risk-based-human-review.md)
+- [ADR-0004: Policy-driven local DAG execution and recovery](adr/0004-governed-step-execution.md)
+- [ADR-0005: H2 and deterministic execution for the prototype](adr/0005-prototype-runtime-and-persistence.md)
+
+## 9. Follow-up work (not implemented by this documentation commit)
+
+1. Make code allocation and click analytics safe under concurrent requests.
+2. Add transactional, concurrency-safe workflow approval and state transitions.
+3. Use a bounded executor and explicit timeout/error handling.
+4. Define restart recovery with step leases, idempotency, and checkpoints.
+5. Harden deployment configuration; add PostgreSQL, migration scripts, and CI/CD.
+
+These are tracked as **future changes**, not claims of existing behavior.
